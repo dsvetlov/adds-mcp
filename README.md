@@ -653,10 +653,15 @@ For stdio-only clients, set `ADDS_TRANSPORT=stdio` (equivalently
 | Escape hatch | `ldap_search`, `get_object_by_dn`, `count_objects` |
 
 Attribute decoding: SIDs → `S-1-5-…`, GUIDs → canonical form, FILETIMEs →
-ISO-8601, `userAccountControl` → decoded flag list + booleans, `groupType` →
-scope + security/distribution, `lockoutDuration` / `maxPwdAge` → ISO-8601
-durations, `gPLink` → structured list of GPO links with enforced/disabled
-flags.
+ISO-8601 (null for AD's zero and "never" values), `userAccountControl` →
+decoded flag list + booleans, `groupType` → scope + security/distribution,
+`lockoutDuration` / `maxPwdAge` and the `msDS-*` durations of fine-grained
+password policies → ISO-8601 durations (`"never"` for AD's "no limit" value),
+`gPLink` → structured list of GPO links with enforced/disabled flags.
+`locked_out` and `password_expired` come from the constructed
+`msDS-User-Account-Control-Computed` (AD never sets those bits in the stored
+`userAccountControl`) and are null where it is not requested, e.g. on
+computers; `flags` includes `LOCKOUT` / `PASSWORD_EXPIRED` when it sets them.
 
 ### `adcs-mcp` — 29 tools
 
