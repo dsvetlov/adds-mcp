@@ -54,6 +54,16 @@ TRUST_TYPE = {1: "WINDOWS_NON_AD", 2: "WINDOWS_AD", 3: "MIT", 4: "DCE"}
 _FILETIME_EPOCH_DELTA = 116444736000000000
 # Sentinel value used by AD for "never" / unset.
 _FILETIME_NEVER = {0, 0x7FFFFFFFFFFFFFFF, -1}
+# Tick intervals use the most negative 64-bit value for "no limit": maxPwdAge
+# when passwords never expire, lockoutDuration when only an administrator ends
+# a lockout. Reported as INTERVAL_NEVER.
+_INTERVAL_NEVER = -0x8000000000000000
+INTERVAL_NEVER = "never"
+
+# Bits AD reports only in the constructed msDS-User-Account-Control-Computed,
+# never in the stored userAccountControl.
+_UF_LOCKOUT = 0x0010
+_UF_PASSWORD_EXPIRED = 0x800000
 
 
 def decode_sid(raw: bytes) -> str | None:
@@ -81,7 +91,18 @@ def decode_guid(raw: bytes) -> str | None:
 
 
 def decode_filetime(value: Any) -> str | None:
-    """Decode an AD Windows FILETIME 18-digit integer into ISO-8601 UTC."""
+    """Decode an AD Windows FILETIME 18-digit integer into ISO-8601 UTC.
+
+    format_entry passes the raw value. For callers holding ldap3's formatted
+    value instead, a datetime is accepted too (0 comes out as 1601-01-01 and
+    "never" as datetime.max; both give None, as their integers do).
+    """
+    if isinstance(value, datetime):
+        if value.year <= 1601 or value.year >= 9999:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
     if value in (None, "", 0, "0"):
         return None
     try:
@@ -116,22 +137,36 @@ def decode_generalized_time(value: Any) -> str | None:
         return s
 
 
-def decode_uac(value: Any) -> dict[str, Any] | None:
-    """Decode a userAccountControl integer into a dict with raw + flags + booleans."""
+def decode_uac(value: Any, computed: Any = None) -> dict[str, Any] | None:
+    """Decode a userAccountControl integer into a dict with raw + flags + booleans.
+
+    AD does not keep LOCKOUT or PASSWORD_EXPIRED in the stored userAccountControl;
+    it reports them only in the constructed msDS-User-Account-Control-Computed,
+    passed here as ``computed``. ``locked_out`` and ``password_expired`` come from
+    it and are None when it was not retrieved.
+    """
     if value is None:
         return None
     try:
         raw = int(value)
     except (TypeError, ValueError):
         return None
-    flags = [name for bit, name in UAC_FLAGS.items() if raw & bit]
+    try:
+        computed_raw = None if computed is None else int(computed)
+    except (TypeError, ValueError):
+        computed_raw = None
+    # LOCKOUT and PASSWORD_EXPIRED can only come from the computed value.
+    reported = raw | ((computed_raw or 0) & (_UF_LOCKOUT | _UF_PASSWORD_EXPIRED))
+    flags = [name for bit, name in UAC_FLAGS.items() if reported & bit]
     return {
         "raw": raw,
         "flags": flags,
         "disabled": bool(raw & 0x0002),
-        "locked_out": bool(raw & 0x0010),
+        "locked_out": None if computed_raw is None else bool(computed_raw & _UF_LOCKOUT),
         "password_never_expires": bool(raw & 0x10000),
-        "password_expired": bool(raw & 0x800000),
+        "password_expired": (
+            None if computed_raw is None else bool(computed_raw & _UF_PASSWORD_EXPIRED)
+        ),
         "smartcard_required": bool(raw & 0x40000),
         "trusted_for_delegation": bool(raw & 0x80000),
         "dont_require_preauth": bool(raw & 0x400000),
@@ -167,15 +202,29 @@ def decode_group_type(value: Any) -> dict[str, Any] | None:
 
 
 def windows_ticks_to_timedelta(value: Any) -> str | None:
-    """Convert a negative Windows tick interval (e.g. lockoutDuration) into an ISO duration."""
-    if value in (None, "", 0, "0"):
+    """Convert a negative Windows tick interval (e.g. lockoutDuration) into an ISO duration.
+
+    The "no limit" value is returned as INTERVAL_NEVER ("never"), zero as "PT0S".
+    format_entry passes the raw value; for callers holding ldap3's formatted
+    value instead, a timedelta is accepted too (timedelta.max is "no limit").
+    """
+    if isinstance(value, timedelta):
+        if value == timedelta.max:
+            return INTERVAL_NEVER
+        return _iso_duration(abs(value.total_seconds()))
+    if value is None or value == "":
         return None
     try:
         n = int(value)
     except (TypeError, ValueError):
         return None
+    if n == _INTERVAL_NEVER:
+        return INTERVAL_NEVER
     # AD stores these as negative 100-nanosecond intervals.
-    seconds = abs(n) / 10_000_000
+    return _iso_duration(abs(n) / 10_000_000)
+
+
+def _iso_duration(seconds: float) -> str:
     if seconds == 0:
         return "PT0S"
     days, remainder = divmod(int(seconds), 86400)
@@ -201,6 +250,7 @@ def windows_ticks_to_timedelta(value: Any) -> str | None:
 _SID_ATTRS = {"objectsid", "sidhistory"}
 _GUID_ATTRS = {"objectguid"}
 _FILETIME_ATTRS = {
+    "msds-userpasswordexpirytimecomputed",
     "lastlogontimestamp",
     "lastlogon",
     "pwdlastset",
@@ -216,7 +266,17 @@ _INTERVAL_ATTRS = {
     "lockoutobservationwindow",
     "maxpwdage",
     "minpwdage",
+    # The same values on a fine-grained password policy (PSO).
+    "msds-lockoutduration",
+    "msds-lockoutobservationwindow",
+    "msds-maximumpasswordage",
+    "msds-minimumpasswordage",
 }
+# Decoded from the raw bytes rather than from ldap3's formatted value, so the
+# result does not depend on whether ldap3 loaded the schema (the server loads
+# it: get_info=ALL makes ldap3 turn FILETIMEs into datetime and tick intervals
+# into timedelta, which int() cannot read).
+_FROM_RAW_ATTRS = _SID_ATTRS | _GUID_ATTRS | _FILETIME_ATTRS | _INTERVAL_ATTRS
 _BOOLEAN_ATTRS = set()  # ldap3 already decodes booleans
 
 
@@ -226,6 +286,10 @@ def _normalize_value(attr_lower: str, value: Any) -> Any:
             return decode_sid(value)
         if attr_lower in _GUID_ATTRS:
             return decode_guid(value)
+        if attr_lower in _FILETIME_ATTRS:
+            return decode_filetime(value)
+        if attr_lower in _INTERVAL_ATTRS:
+            return windows_ticks_to_timedelta(value)
         # Fallback: try to decode as UTF-8; otherwise return hex.
         try:
             return value.decode("utf-8")
@@ -244,6 +308,12 @@ def _normalize_value(attr_lower: str, value: Any) -> Any:
     return value
 
 
+def _get_ci(values: dict[str, Any], name: str) -> Any:
+    """values[name], matching the attribute name case-insensitively."""
+    wanted = name.lower()
+    return next((v for k, v in values.items() if k.lower() == wanted), None)
+
+
 def format_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Convert an ldap3 entry-as-dict into a JSON-friendly, decoded dict.
 
@@ -259,8 +329,8 @@ def format_entry(entry: dict[str, Any]) -> dict[str, Any]:
     decoded: dict[str, Any] = {}
     for name, value in attrs.items():
         attr_lower = name.lower()
-        # SIDs/GUIDs must come from raw bytes, not the ldap3-decoded form.
-        if attr_lower in _SID_ATTRS or attr_lower in _GUID_ATTRS:
+        # SIDs/GUIDs, FILETIMEs and tick intervals come from the raw bytes.
+        if attr_lower in _FROM_RAW_ATTRS:
             raw_values = raw.get(name) or []
             if isinstance(raw_values, list):
                 decoded_values = [_normalize_value(attr_lower, v) for v in raw_values]
@@ -273,13 +343,17 @@ def format_entry(entry: dict[str, Any]) -> dict[str, Any]:
             decoded[name] = new_list[0] if len(new_list) == 1 else new_list
         else:
             decoded[name] = _normalize_value(attr_lower, value)
-    # Convenience decoded views for common flag attrs.
-    if "userAccountControl" in attrs:
-        uac = decode_uac(attrs["userAccountControl"])
+    # Convenience decoded views for common flag attrs (from the unwrapped values:
+    # without schema information ldap3 returns even single values as lists).
+    uac_value = _get_ci(decoded, "userAccountControl")
+    if uac_value is not None:
+        computed = _get_ci(decoded, "msDS-User-Account-Control-Computed")
+        uac = decode_uac(uac_value, computed)
         if uac is not None:
             decoded["userAccountControl_decoded"] = uac
-    if "groupType" in attrs:
-        gt = decode_group_type(attrs["groupType"])
+    group_type = _get_ci(decoded, "groupType")
+    if group_type is not None:
+        gt = decode_group_type(group_type)
         if gt is not None:
             decoded["groupType_decoded"] = gt
     result["attributes"] = decoded

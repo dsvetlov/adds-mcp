@@ -174,7 +174,15 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
             attributes=USER_ATTRS,
             size_limit=limit,
         )
-        return {"count": len(results), "users": results}
+        # lockoutTime stays set after a lockout expires, until the next logon; only
+        # the computed flag says whether the account is locked now.
+        locked = [
+            user
+            for user in results
+            if user.get("attributes", {}).get("userAccountControl_decoded", {}).get("locked_out")
+            is not False
+        ]
+        return {"count": len(locked), "users": locked}
 
     @mcp.tool(
         annotations={

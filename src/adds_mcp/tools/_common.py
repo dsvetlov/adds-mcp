@@ -22,6 +22,9 @@ USER_ATTRS = [
     "employeeType",
     "description",
     "userAccountControl",
+    # Constructed: the only place AD reports lockout and password expiry.
+    "msDS-User-Account-Control-Computed",
+    "msDS-UserPasswordExpiryTimeComputed",
     "accountExpires",
     "pwdLastSet",
     "lastLogonTimestamp",
