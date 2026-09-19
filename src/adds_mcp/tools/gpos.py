@@ -165,9 +165,17 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
         # Enrich with GPO displayName lookups.
         enriched: list[dict[str, Any]] = []
         for lnk in links:
-            gpo_obj = client.read_object(
-                lnk["gpo_dn"], attributes=["displayName", "cn"]
-            )
+            # A link may point at a GPO of another domain, which this directory
+            # does not hold: report it on that link rather than failing them all.
+            try:
+                gpo_obj = client.read_object(
+                    lnk["gpo_dn"], attributes=["displayName", "cn"]
+                )
+            except RuntimeError as exc:
+                enriched.append(
+                    {**lnk, "gpo_display_name": None, "gpo_cn": None, "error": str(exc)}
+                )
+                continue
             attrs = (gpo_obj or {}).get("attributes", {})
             enriched.append(
                 {

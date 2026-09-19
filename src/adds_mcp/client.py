@@ -6,7 +6,7 @@ import logging
 import ssl
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from ldap3 import (
     ALL,
@@ -20,7 +20,9 @@ from ldap3 import (
     ServerPool,
     Tls,
 )
-from ldap3.core.exceptions import LDAPException
+from ldap3.core.exceptions import LDAPException, LDAPInvalidDnError
+from ldap3.core.results import RESULT_REFERRAL
+from ldap3.utils.dn import parse_dn, safe_dn
 
 from .config import Settings
 from .formatting import format_entry
@@ -31,6 +33,22 @@ log = logging.getLogger(__name__)
 _FILETIME_EPOCH_DELTA = 116444736000000000
 
 SCOPE_MAP = {"base": BASE, "one": LEVEL, "level": LEVEL, "sub": SUBTREE, "subtree": SUBTREE}
+
+# Global Catalog ports: a GC also answers for the other domains of the forest.
+_GC_PORTS = {3268, 3269}
+_PAGED_RESULTS_OID = "1.2.840.113556.1.4.319"
+
+
+class SearchBaseOutOfScope(RuntimeError):
+    """A search base outside the naming contexts this directory serves.
+
+    A RuntimeError, like every other search failure, so that tools which
+    already report per-lookup errors keep doing so.
+    """
+
+
+class ReferralNotFollowed(RuntimeError):
+    """The directory answered with a referral, which this server never follows."""
 
 
 class ReadOnlyADClient:
@@ -59,6 +77,9 @@ class ReadOnlyADClient:
                 tls=tls,
                 get_info=ALL,
                 connect_timeout=self._settings.query_timeout_seconds,
+                # ldap3 defaults to following referrals to any host *with the bind
+                # credentials*; see the note in _connect.
+                allowed_referral_hosts=[],
             )
             for host in self._settings.servers
         ]
@@ -76,6 +97,13 @@ class ReadOnlyADClient:
             read_only=True,
             receive_timeout=self._settings.query_timeout_seconds,
             raise_exceptions=True,
+            # Never chase referrals. ldap3's defaults (auto_referrals=True and
+            # allowed_referral_hosts=[('*', True)]) make a search whose base lies
+            # outside this directory - e.g. base_dn="DC=evil,DC=example" supplied
+            # by a model - open a new connection to the host named in the
+            # referral and simple-bind there with the service account's DN and
+            # password, in clear text for ldap:// referrals.
+            auto_referrals=False,
         )
         log.info("Bound to AD as %s via %s", self._settings.bind_dn, self._settings.servers)
         return conn
@@ -95,6 +123,98 @@ class ReadOnlyADClient:
                     pass
                 self._connection = None
 
+    # ---------------------------------------------------------------- scoping
+    def _allowed_roots(self, conn: Connection) -> list[str]:
+        """The configured base DN, the naming contexts the DC advertises and,
+        on a Global Catalog port, the forest root domain.
+
+        The naming contexts cover the Configuration partition that list_sites
+        reads, which in a child domain does not lie under the base DN. On a GC
+        port the forest root admits the root domain and every domain beneath
+        it; a second tree of the same forest is still refused. This is a coarse
+        bound: a child domain lies beneath a forest-root base DN, and a DC that
+        does not hold it answers with a referral - see _paged_entries.
+        """
+        roots = [self._settings.base_dn]
+        info = getattr(conn.server, "info", None)
+        roots.extend(getattr(info, "naming_contexts", None) or [])
+        if self._settings.port in _GC_PORTS:
+            other = getattr(info, "other", None) or {}
+            roots.extend(other.get("rootDomainNamingContext") or [])
+        unique: dict[str, str] = {}
+        for root in roots:
+            if root:
+                unique.setdefault(root.lower(), root)
+        return list(unique.values())
+
+    def _scoped_base(self, conn: Connection, base: str) -> str:
+        """Return ``base`` unchanged if it lies within this directory, else raise.
+
+        Defence in depth: the referral settings in _build_pool and _connect are
+        what keep credentials from leaving; this refuses a base outside the
+        directory before any request, with an error the caller can act on.
+        """
+        roots = self._allowed_roots(conn)
+        try:
+            dn = _base_to_check(base)
+            inside = dn is None or any(dn_within(dn, root) for root in roots)
+        except ValueError as exc:
+            raise SearchBaseOutOfScope(str(exc)) from None
+        if inside:
+            return base
+        raise SearchBaseOutOfScope(
+            f"Search base {base!r} is outside the directory served by this "
+            f"server (allowed: {', '.join(roots)})."
+        )
+
+    @staticmethod
+    def _paged_entries(
+        conn: Connection,
+        *,
+        base: str,
+        search_filter: str,
+        scope: Any,
+        attributes: Any,
+        page: int,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield the responses of a paged search, page by page.
+
+        ldap3's own paged_search drops a referral result without a word once
+        referrals are not followed (resultCode 10 is never raised), so a search
+        whose base the DC does not hold would look empty. It is reported here.
+        """
+        if conn.check_names:
+            base = safe_dn(base)
+        cookie = None
+        while True:
+            outcome = conn.search(
+                search_base=base,
+                search_filter=search_filter,
+                search_scope=scope,
+                attributes=attributes,
+                get_operational_attributes=True,
+                paged_size=page,
+                paged_cookie=cookie,
+            )
+            if isinstance(outcome, tuple):  # thread-safe strategies (SAFE_SYNC)
+                _status, result, response, _request = outcome
+            else:
+                result, response = conn.result, conn.response
+            result = result or {}
+            if result.get("result") == RESULT_REFERRAL or result.get("referrals"):
+                targets = ", ".join(result.get("referrals") or []) or "another server"
+                raise ReferralNotFollowed(
+                    f"The directory referred the search for {base!r} to {targets}; "
+                    "referrals are not followed."
+                )
+            yield from response or []
+            try:
+                cookie = result["controls"][_PAGED_RESULTS_OID]["value"]["cookie"]
+            except (KeyError, TypeError):
+                cookie = None
+            if not cookie:
+                return
+
     # ---------------------------------------------------------------- queries
     def search(
         self,
@@ -109,7 +229,7 @@ class ReadOnlyADClient:
         """Perform a paged LDAP search and return decoded entries."""
         conn = self._get_connection()
         scope_val = SCOPE_MAP.get(scope.lower(), SUBTREE)
-        base = base_dn or self._settings.base_dn
+        base = self._scoped_base(conn, base_dn or self._settings.base_dn)
         page = page_size or self._settings.default_page_size
         cap = min(
             size_limit if size_limit else self._settings.max_page_size,
@@ -125,14 +245,13 @@ class ReadOnlyADClient:
 
         try:
             results: list[dict[str, Any]] = []
-            for entry in conn.extend.standard.paged_search(
-                search_base=base,
+            for entry in self._paged_entries(
+                conn,
+                base=base,
                 search_filter=search_filter,
-                search_scope=scope_val,
+                scope=scope_val,
                 attributes=attrs,
-                paged_size=min(page, cap),
-                generator=True,
-                get_operational_attributes=True,
+                page=min(page, cap),
             ):
                 if entry.get("type") != "searchResEntry":
                     continue
@@ -202,6 +321,56 @@ def escape_filter(value: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _rdns(dn: str) -> list[frozenset[tuple[str, str]]]:
+    """The RDNs of a DN, most specific first, each as a set of (attribute, value)
+    pairs compared case-insensitively (a multi-valued RDN joins pairs with '+')."""
+    try:
+        parts = parse_dn(dn, escape=False, strip=False)
+    except LDAPInvalidDnError as exc:
+        raise ValueError(f"Invalid DN: {dn!r}") from exc
+    rdns: list[frozenset[tuple[str, str]]] = []
+    current: list[tuple[str, str]] = []
+    for attr, value, separator in parts:
+        current.append((attr.lower(), value.lower()))
+        if separator != "+":
+            rdns.append(frozenset(current))
+            current = []
+    return rdns
+
+
+def dn_within(dn: str, root: str) -> bool:
+    """True if ``dn`` equals ``root`` or lies beneath it, RDN by RDN, case-insensitively.
+
+    Raises ValueError for a malformed ``dn``.
+    """
+    inner = _rdns(dn)
+    outer = _rdns(root)
+    if not outer or len(inner) < len(outer):
+        return False
+    return inner[len(inner) - len(outer) :] == outer
+
+
+def _base_to_check(base: str) -> str | None:
+    """The DN a search base names, or None when it names no location.
+
+    AD also accepts extended forms. <GUID=...> and <SID=...> name an object by
+    identity and carry no location to check; <WKGUID=guid,DN> names a
+    well-known container under DN, and DN is what is checked.
+    """
+    text = base.strip()
+    if not (text.startswith("<") and text.endswith(">")):
+        return base
+    kind, _, rest = text[1:-1].partition("=")
+    kind = kind.strip().upper()
+    if kind in ("GUID", "SID"):
+        return None
+    if kind == "WKGUID":
+        _guid, comma, dn = rest.partition(",")
+        if comma and dn.strip():
+            return dn
+    raise ValueError(f"Unsupported search base: {base!r}")
 
 
 def escape_dn(value: str) -> str:
