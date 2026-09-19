@@ -330,6 +330,9 @@ _CREDENTIAL_ATTRS = {
     "supplementalcredentials",
     "msds-managedpassword",  # gMSA
     "userpassword",
+    "ms-pki-accountcredentials",  # credential roaming / DPAPI
+    "ms-pki-dpapimasterkeys",
+    "ms-pki-roamingtimestamp",
 }
 # A value longer than this, once it is bytes we could not decode, is reported
 # as its size rather than dumped as hex (photos, certificates, SDs).

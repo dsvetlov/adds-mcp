@@ -182,7 +182,7 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
             size_limit=limit + 1,
             page_size=limit + 1,
         )
-        truncated = len(results) > limit
+        truncated = len(results) > limit or len(results) >= client.max_entries
         return {
             "user_dn": user_dn,
             "recursive": recursive,
@@ -204,20 +204,27 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
         limit: Annotated[int, Field(default=100, ge=1, le=500)] = 100,
     ) -> dict[str, Any]:
         """List accounts currently locked out by the domain lockout policy."""
-        results = client.search(
+        # lockoutTime>=1 also matches accounts whose lockout has already expired
+        # (lockoutTime is cleared only at the next logon), so filter afterwards
+        # by the computed flag. Fetch a wide candidate set first, or the filter
+        # could drop real lockouts sitting past the limit.
+        candidates = client.search(
             search_filter=_user_filter("(lockoutTime>=1)"),
             attributes=USER_ATTRS,
-            size_limit=limit,
+            size_limit=client.max_entries,
         )
-        # lockoutTime stays set after a lockout expires, until the next logon; only
-        # the computed flag says whether the account is locked now.
         locked = [
             user
-            for user in results
+            for user in candidates
             if user.get("attributes", {}).get("userAccountControl_decoded", {}).get("locked_out")
-            is not False
+            is True
         ]
-        return {"count": len(locked), "users": locked}
+        return {
+            "count": min(len(locked), limit),
+            "candidates_examined": len(candidates),
+            "truncated": len(locked) > limit or len(candidates) >= client.max_entries,
+            "users": locked[:limit],
+        }
 
     @mcp.tool(
         annotations={

@@ -129,17 +129,13 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
             ),
         ] = "all",
         limit: Annotated[int, Field(default=200, ge=1, le=500)] = 200,
-        offset: Annotated[
-            int,
-            Field(
-                default=0, ge=0, description="Skip this many members (paging within a large group)."
-            ),
-        ] = 0,
     ) -> dict[str, Any]:
         """List the members of a group. Direct by default, transitive with recursive=True.
 
-        A large group is paged with ``offset`` / ``limit``; ``truncated`` says
-        whether more remain past this page.
+        Returns up to ``limit`` members; ``truncated`` says whether the group
+        has more (get_group's ``member_count`` is the total). For a group larger
+        than the server page cap, narrow with ``object_types`` rather than
+        paging: LDAP gives no stable order to page a plain member search by.
         """
         grp = _resolve_group(client, identifier)
         if not grp.get("found") or grp.get("ambiguous"):
@@ -171,18 +167,20 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
                 "mail",
                 "objectClass",
             ],
-            size_limit=offset + limit + 1,
-            page_size=offset + limit + 1,
+            size_limit=limit + 1,
+            page_size=limit + 1,
         )
-        page = results[offset : offset + limit]
+        # More than the page fit, or the search itself hit the server cap
+        # (client.search never returns beyond max_entries): either way there
+        # is more than this page shows.
+        truncated = len(results) > limit or len(results) >= client.max_entries
         return {
             "group_dn": group_dn,
             "recursive": recursive,
             "object_types": object_types,
-            "offset": offset,
-            "count": len(page),
-            "truncated": len(results) > offset + limit,
-            "members": page,
+            "count": min(len(results), limit),
+            "truncated": truncated,
+            "members": results[:limit],
         }
 
     @mcp.tool(
@@ -215,7 +213,7 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
     def list_privileged_groups(
         limit: Annotated[int, Field(default=100, ge=1, le=500)] = 100,
     ) -> dict[str, Any]:
-        """List built-in privileged groups (adminCount=1) and their direct members."""
+        """List built-in privileged groups (adminCount=1); each card carries member_count (use list_group_members for the names)."""
         results = client.search(
             search_filter=_group_filter("(adminCount=1)"),
             attributes=GROUP_ATTRS + ["adminCount"],

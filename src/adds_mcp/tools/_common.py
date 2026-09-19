@@ -14,7 +14,7 @@ _COMPUTED_ATTRS = [
 # and list tools keep the compact sets below, so a page of results stays small.
 FULL_USER_ATTRS = ["*", *_COMPUTED_ATTRS]
 FULL_GROUP_ATTRS = ["*"]
-FULL_COMPUTER_ATTRS = ["*", "msDS-User-Account-Control-Computed"]
+FULL_COMPUTER_ATTRS = ["*"]  # computer accounts do not lock out; no computed UAC
 
 USER_ATTRS = [
     "cn",

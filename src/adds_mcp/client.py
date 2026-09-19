@@ -20,7 +20,12 @@ from ldap3 import (
     ServerPool,
     Tls,
 )
-from ldap3.core.exceptions import LDAPBindError, LDAPException, LDAPInvalidDnError
+from ldap3.core.exceptions import (
+    LDAPBindError,
+    LDAPException,
+    LDAPInvalidCredentialsResult,
+    LDAPInvalidDnError,
+)
 from ldap3.core.results import RESULT_REFERRAL
 from ldap3.utils.dn import parse_dn, safe_dn
 
@@ -42,6 +47,15 @@ _PAGED_RESULTS_OID = "1.2.840.113556.1.4.319"
 def _describe(exc: BaseException) -> str:
     """A short, credential-free description of an ldap3 exception."""
     return str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+
+
+def _is_invalid_credentials(exc: BaseException) -> bool:
+    """True when a bind failure means the password was wrong (LDAP result 49),
+    as opposed to a transient failure (a DC down, a network error)."""
+    if isinstance(exc, LDAPInvalidCredentialsResult):
+        return True
+    text = str(exc).lower()
+    return "invalidcredentials" in text or "data 52e" in text or "result 49" in text
 
 
 class CredentialsRejected(RuntimeError):
@@ -133,7 +147,14 @@ class ReadOnlyADClient:
             if self._connection is None or not self._connection.bound:
                 try:
                     self._connection = self._connect()
-                except LDAPBindError as exc:
+                except (LDAPBindError, LDAPInvalidCredentialsResult) as exc:
+                    # Latch only on *wrong credentials*: a wrong or rotated
+                    # password would otherwise be retried on every call and lock
+                    # the account out. A different bind failure (a DC down, a
+                    # network blip) is transient — re-raise it so the next call
+                    # tries again instead of disabling the sidecar for good.
+                    if not _is_invalid_credentials(exc):
+                        raise
                     self._credentials_rejected = (
                         f"the bind account was rejected ({_describe(exc)}); refusing "
                         "further attempts so the account is not locked out — restart "
@@ -141,6 +162,11 @@ class ReadOnlyADClient:
                     )
                     raise CredentialsRejected(self._credentials_rejected) from exc
             return self._connection
+
+    @property
+    def max_entries(self) -> int:
+        """The hard ceiling client.search will ever return (the paging cap)."""
+        return self._settings.max_page_size
 
     def close(self) -> None:
         with self._lock:
