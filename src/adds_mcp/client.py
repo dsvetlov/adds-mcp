@@ -25,6 +25,9 @@ from ldap3.core.exceptions import (
     LDAPException,
     LDAPInvalidCredentialsResult,
     LDAPInvalidDnError,
+    LDAPSessionTerminatedByServerError,
+    LDAPSocketReceiveError,
+    LDAPSocketSendError,
 )
 from ldap3.core.results import RESULT_REFERRAL
 from ldap3.utils.dn import parse_dn, safe_dn
@@ -168,6 +171,24 @@ class ReadOnlyADClient:
         """The hard ceiling client.search will ever return (the paging cap)."""
         return self._settings.max_page_size
 
+    def _discard_connection(self) -> None:
+        """Drop the cached connection so the next call binds afresh.
+
+        An idle LDAP(S) connection is closed by the DC (idle timeout, SSL
+        session expiry) without the client noticing: ldap3 leaves ``.bound``
+        True, so _get_connection would hand back the dead socket forever and
+        every query would fail with a broken pipe / bad-length SSL error until
+        the process restarts. search() calls this on a communication error and
+        retries once against a fresh bind.
+        """
+        with self._lock:
+            if self._connection is not None:
+                try:
+                    self._connection.unbind()
+                except LDAPException:
+                    pass
+                self._connection = None
+
     def close(self) -> None:
         with self._lock:
             if self._connection is not None:
@@ -280,8 +301,53 @@ class ReadOnlyADClient:
         page_size: int | None = None,
         size_limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Perform a paged LDAP search and return decoded entries."""
+        """Perform a paged LDAP search and return decoded entries.
+
+        If the cached connection has been closed by the DC while idle (idle
+        timeout, SSL session expiry), the first query on it fails with a
+        broken-pipe / bad-length socket error, yet ldap3 leaves ``.bound`` True
+        — so the dead socket would be reused on every later call. On such a
+        *mid-use* socket error, drop the connection and try once more against a
+        fresh bind. Connect-time failures propagate as before (the first
+        _get_connection is outside the try); any other LDAP error is reported.
+        """
+        kwargs: dict[str, Any] = {
+            "search_filter": search_filter,
+            "base_dn": base_dn,
+            "scope": scope,
+            "attributes": attributes,
+            "page_size": page_size,
+            "size_limit": size_limit,
+        }
         conn = self._get_connection()
+        try:
+            return self._run_search(conn, **kwargs)
+        except (
+            LDAPSocketSendError,
+            LDAPSocketReceiveError,
+            LDAPSessionTerminatedByServerError,
+        ):
+            self._discard_connection()
+        except LDAPException as exc:
+            raise RuntimeError(f"LDAP search failed: {exc}") from exc
+        # The connection died mid-use; reconnect and try once more.
+        try:
+            conn = self._get_connection()
+            return self._run_search(conn, **kwargs)
+        except LDAPException as exc:
+            raise RuntimeError(f"LDAP search failed: {exc}") from exc
+
+    def _run_search(
+        self,
+        conn: Connection,
+        *,
+        search_filter: str,
+        base_dn: str | None,
+        scope: str,
+        attributes: Iterable[str] | str | None,
+        page_size: int | None,
+        size_limit: int | None,
+    ) -> list[dict[str, Any]]:
         scope_val = SCOPE_MAP.get(scope.lower(), SUBTREE)
         base = self._scoped_base(conn, base_dn or self._settings.base_dn)
         page = page_size or self._settings.default_page_size
@@ -297,24 +363,21 @@ class ReadOnlyADClient:
         else:
             attrs = list(attributes)
 
-        try:
-            results: list[dict[str, Any]] = []
-            for entry in self._paged_entries(
-                conn,
-                base=base,
-                search_filter=search_filter,
-                scope=scope_val,
-                attributes=attrs,
-                page=min(page, cap),
-            ):
-                if entry.get("type") != "searchResEntry":
-                    continue
-                results.append(format_entry(entry))
-                if len(results) >= cap:
-                    break
-            return results
-        except LDAPException as exc:
-            raise RuntimeError(f"LDAP search failed: {exc}") from exc
+        results: list[dict[str, Any]] = []
+        for entry in self._paged_entries(
+            conn,
+            base=base,
+            search_filter=search_filter,
+            scope=scope_val,
+            attributes=attrs,
+            page=min(page, cap),
+        ):
+            if entry.get("type") != "searchResEntry":
+                continue
+            results.append(format_entry(entry))
+            if len(results) >= cap:
+                break
+        return results
 
     def read_object(
         self,
@@ -342,9 +405,7 @@ class ReadOnlyADClient:
                 "vendor_name": getattr(info, "vendor_name", None),
                 "vendor_version": getattr(info, "vendor_version", None),
                 "naming_contexts": list(getattr(info, "naming_contexts", []) or []),
-                "supported_ldap_versions": list(
-                    getattr(info, "supported_ldap_versions", []) or []
-                ),
+                "supported_ldap_versions": list(getattr(info, "supported_ldap_versions", []) or []),
                 "supported_sasl_mechanisms": list(
                     getattr(info, "supported_sasl_mechanisms", []) or []
                 ),

@@ -211,3 +211,62 @@ def test_transient_bind_failure_is_not_latched() -> None:
         with pytest.raises(LDAPSocketOpenError):
             ad.search(search_filter="(objectClass=*)")
     assert type(ad).attempts == 2  # a transient failure is retried, not latched
+
+
+def _idle_drop_client(fail_times: int):
+    """A client whose paged search raises a socket-send error the first
+    ``fail_times`` calls (an idle connection the DC has closed), then succeeds.
+    Connection acquisition and discard are stubbed and counted."""
+    settings = Settings(
+        servers=["dc"], bind_dn=BIND_DN, bind_password="x", base_dn=BASE, _env_file=None
+    )
+
+    class _Client(ReadOnlyADClient):
+        connects = 0
+        discards = 0
+        searches = 0
+
+        def _get_connection(self):  # type: ignore[override]
+            type(self).connects += 1
+            return object()
+
+        def _discard_connection(self):  # type: ignore[override]
+            type(self).discards += 1
+
+        def _scoped_base(self, conn, base):  # type: ignore[override]
+            return base
+
+        def _paged_entries(self, conn, *, base, search_filter, scope, attributes, page):  # type: ignore[override]
+            from ldap3.core.exceptions import LDAPSocketSendError
+
+            type(self).searches += 1
+            if type(self).searches <= fail_times:
+                raise LDAPSocketSendError("socket sending error[Errno 32] Broken pipe")
+            yield {
+                "type": "searchResEntry",
+                "dn": f"CN=x,{BASE}",
+                "attributes": {"cn": "x"},
+                "raw_attributes": {},
+            }
+
+    return _Client(settings)
+
+
+def test_search_reconnects_after_an_idle_connection_death() -> None:
+    # ldap3 leaves .bound True on a broken socket, so without this the dead
+    # connection would be reused forever; one mid-use socket error must drop it
+    # and retry against a fresh bind.
+    ad = _idle_drop_client(fail_times=1)
+    results = ad.search(search_filter="(objectClass=*)")
+    assert len(results) == 1
+    assert type(ad).discards == 1  # the dead connection was dropped
+    assert type(ad).connects == 2  # one initial + one reconnect
+    assert type(ad).searches == 2  # failed once, retried once
+
+
+def test_search_gives_up_after_a_second_socket_death() -> None:
+    ad = _idle_drop_client(fail_times=2)
+    with pytest.raises(RuntimeError, match="LDAP search failed"):
+        ad.search(search_filter="(objectClass=*)")
+    assert type(ad).discards == 1  # dropped once; a second failure is not retried again
+    assert type(ad).searches == 2
