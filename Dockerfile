@@ -6,10 +6,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY src ./src
 
-RUN pip install --upgrade pip && pip install .
+RUN pip install --upgrade pip && pip install . -c constraints.txt
+
+# Loopback-only sidecar; run unprivileged.
+RUN useradd --system --uid 10001 adds && chown -R adds /app
+USER adds
 
 EXPOSE 8080
 

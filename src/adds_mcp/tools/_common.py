@@ -2,6 +2,20 @@
 
 from __future__ import annotations
 
+# Constructed attributes AD does not return under "*" and that the cards need.
+_COMPUTED_ATTRS = [
+    "msDS-User-Account-Control-Computed",
+    "msDS-UserPasswordExpiryTimeComputed",
+    "msDS-ResultantPSO",
+]
+# What a single-object read requests: every attribute the bind account may see,
+# plus the constructed ones. format_entry withholds credential attributes and
+# summarises large binaries, so "*" is safe to ask for. The multi-object search
+# and list tools keep the compact sets below, so a page of results stays small.
+FULL_USER_ATTRS = ["*", *_COMPUTED_ATTRS]
+FULL_GROUP_ATTRS = ["*"]
+FULL_COMPUTER_ATTRS = ["*", "msDS-User-Account-Control-Computed"]
+
 USER_ATTRS = [
     "cn",
     "distinguishedName",

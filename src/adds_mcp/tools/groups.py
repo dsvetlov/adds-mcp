@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ..client import ReadOnlyADClient, escape_filter
-from ._common import GROUP_ATTRS
+from ._common import FULL_GROUP_ATTRS, GROUP_ATTRS
 
 
 def _group_filter(inner: str | None) -> str:
@@ -18,10 +18,12 @@ def _group_filter(inner: str | None) -> str:
     return f"(&{base}{inner})"
 
 
-def _resolve_group(client: ReadOnlyADClient, identifier: str) -> dict[str, Any]:
+def _resolve_group(
+    client: ReadOnlyADClient, identifier: str, attributes: list[str] = GROUP_ATTRS
+) -> dict[str, Any]:
     ident = escape_filter(identifier)
     filt = _group_filter(f"(|(sAMAccountName={ident})(cn={ident})(distinguishedName={ident}))")
-    results = client.search(search_filter=filt, attributes=GROUP_ATTRS, size_limit=2)
+    results = client.search(search_filter=filt, attributes=attributes, size_limit=2)
     if not results:
         return {"found": False, "identifier": identifier}
     if len(results) > 1:
@@ -95,7 +97,7 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
         ],
     ) -> dict[str, Any]:
         """Return the full attribute set for a single group."""
-        return _resolve_group(client, identifier)
+        return _resolve_group(client, identifier, attributes=FULL_GROUP_ATTRS)
 
     @mcp.tool(
         annotations={
@@ -127,8 +129,18 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
             ),
         ] = "all",
         limit: Annotated[int, Field(default=200, ge=1, le=500)] = 200,
+        offset: Annotated[
+            int,
+            Field(
+                default=0, ge=0, description="Skip this many members (paging within a large group)."
+            ),
+        ] = 0,
     ) -> dict[str, Any]:
-        """List the members of a group. Direct by default, transitive with recursive=True."""
+        """List the members of a group. Direct by default, transitive with recursive=True.
+
+        A large group is paged with ``offset`` / ``limit``; ``truncated`` says
+        whether more remain past this page.
+        """
         grp = _resolve_group(client, identifier)
         if not grp.get("found") or grp.get("ambiguous"):
             return {"found": False, "identifier": identifier}
@@ -159,14 +171,18 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
                 "mail",
                 "objectClass",
             ],
-            size_limit=limit,
+            size_limit=offset + limit + 1,
+            page_size=offset + limit + 1,
         )
+        page = results[offset : offset + limit]
         return {
             "group_dn": group_dn,
             "recursive": recursive,
             "object_types": object_types,
-            "count": len(results),
-            "members": results,
+            "offset": offset,
+            "count": len(page),
+            "truncated": len(results) > offset + limit,
+            "members": page,
         }
 
     @mcp.tool(

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     tls_validate: bool = True
     ca_cert_file: str = ""
 
-    http_host: str = "0.0.0.0"
+    http_host: str = "127.0.0.1"
     http_port: int = 8080
 
     max_page_size: int = 500

@@ -20,7 +20,7 @@ from ldap3 import (
     ServerPool,
     Tls,
 )
-from ldap3.core.exceptions import LDAPException, LDAPInvalidDnError
+from ldap3.core.exceptions import LDAPBindError, LDAPException, LDAPInvalidDnError
 from ldap3.core.results import RESULT_REFERRAL
 from ldap3.utils.dn import parse_dn, safe_dn
 
@@ -37,6 +37,18 @@ SCOPE_MAP = {"base": BASE, "one": LEVEL, "level": LEVEL, "sub": SUBTREE, "subtre
 # Global Catalog ports: a GC also answers for the other domains of the forest.
 _GC_PORTS = {3268, 3269}
 _PAGED_RESULTS_OID = "1.2.840.113556.1.4.319"
+
+
+def _describe(exc: BaseException) -> str:
+    """A short, credential-free description of an ldap3 exception."""
+    return str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+
+
+class CredentialsRejected(RuntimeError):
+    """The bind account was rejected; calls are refused until a restart.
+
+    A RuntimeError, like every other search failure, so the tools report it.
+    """
 
 
 class SearchBaseOutOfScope(RuntimeError):
@@ -58,6 +70,12 @@ class ReadOnlyADClient:
         self._settings = settings
         self._lock = threading.Lock()
         self._connection: Connection | None = None
+        # Set once a bind is rejected for bad credentials. The bind account is
+        # a real domain account (the bot's own), so retrying a wrong or rotated
+        # password on every call would lock it out after the lockout threshold.
+        # We refuse further calls until the process is restarted with a good
+        # password instead.
+        self._credentials_rejected: str | None = None
 
     # ------------------------------------------------------------------ setup
     def _build_tls(self) -> Tls:
@@ -110,8 +128,18 @@ class ReadOnlyADClient:
 
     def _get_connection(self) -> Connection:
         with self._lock:
+            if self._credentials_rejected is not None:
+                raise CredentialsRejected(self._credentials_rejected)
             if self._connection is None or not self._connection.bound:
-                self._connection = self._connect()
+                try:
+                    self._connection = self._connect()
+                except LDAPBindError as exc:
+                    self._credentials_rejected = (
+                        f"the bind account was rejected ({_describe(exc)}); refusing "
+                        "further attempts so the account is not locked out — restart "
+                        "with a correct password"
+                    )
+                    raise CredentialsRejected(self._credentials_rejected) from exc
             return self._connection
 
     def close(self) -> None:

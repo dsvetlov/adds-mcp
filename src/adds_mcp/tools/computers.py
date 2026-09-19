@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ..client import ReadOnlyADClient, escape_filter, filetime_days_ago
-from ._common import COMPUTER_ATTRS
+from ._common import COMPUTER_ATTRS, FULL_COMPUTER_ATTRS
 
 
 def _computer_filter(inner: str | None) -> str:
@@ -95,7 +95,7 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
             f"(distinguishedName={ident})"
             ")"
         )
-        results = client.search(search_filter=filt, attributes=COMPUTER_ATTRS, size_limit=2)
+        results = client.search(search_filter=filt, attributes=FULL_COMPUTER_ATTRS, size_limit=2)
         if not results:
             return {"found": False, "identifier": identifier}
         if len(results) > 1:

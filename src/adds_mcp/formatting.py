@@ -290,10 +290,13 @@ def _normalize_value(attr_lower: str, value: Any) -> Any:
             return decode_filetime(value)
         if attr_lower in _INTERVAL_ATTRS:
             return windows_ticks_to_timedelta(value)
-        # Fallback: try to decode as UTF-8; otherwise return hex.
+        # Fallback: text if it decodes, otherwise summarise the bytes rather
+        # than dump hex that only bloats the result (photos, certificates).
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError:
+            if len(value) > _BINARY_SUMMARY_BYTES:
+                return f"<binary, {len(value)} bytes>"
             return value.hex()
     if attr_lower in _FILETIME_ATTRS:
         return decode_filetime(value)
@@ -306,6 +309,31 @@ def _normalize_value(attr_lower: str, value: Any) -> Any:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).isoformat()
     return value
+
+
+# Attributes that are credentials by nature: never returned, even when the
+# bind account can read them, and whatever the caller requested (e.g. "*").
+_CREDENTIAL_ATTRS = {
+    "ms-mcs-admpwd",  # LAPS (legacy)
+    "ms-mcs-admpwdexpirationtime",
+    "mslaps-password",
+    "mslaps-encryptedpassword",
+    "mslaps-encryptedpasswordhistory",
+    "mslaps-encrypteddsrmpassword",
+    "mslaps-encrypteddsrmpasswordhistory",
+    "msfve-recoverypassword",  # BitLocker
+    "msfve-keypackage",
+    "unicodepwd",
+    "dbcspwd",
+    "ntpwdhistory",
+    "lmpwdhistory",
+    "supplementalcredentials",
+    "msds-managedpassword",  # gMSA
+    "userpassword",
+}
+# A value longer than this, once it is bytes we could not decode, is reported
+# as its size rather than dumped as hex (photos, certificates, SDs).
+_BINARY_SUMMARY_BYTES = 256
 
 
 def _get_ci(values: dict[str, Any], name: str) -> Any:
@@ -329,6 +357,9 @@ def format_entry(entry: dict[str, Any]) -> dict[str, Any]:
     decoded: dict[str, Any] = {}
     for name, value in attrs.items():
         attr_lower = name.lower()
+        # Credentials are never returned, whatever was requested.
+        if attr_lower in _CREDENTIAL_ATTRS:
+            continue
         # SIDs/GUIDs, FILETIMEs and tick intervals come from the raw bytes.
         if attr_lower in _FROM_RAW_ATTRS:
             raw_values = raw.get(name) or []
@@ -356,5 +387,14 @@ def format_entry(entry: dict[str, Any]) -> dict[str, Any]:
         gt = decode_group_type(group_type)
         if gt is not None:
             decoded["groupType_decoded"] = gt
+    # A card carries the size of its big multi-valued lists, not the lists
+    # themselves: an account can be in hundreds of groups and a group can hold
+    # thousands of members, which would blow past the result cap. The
+    # dedicated list tools return the entries, with a filter and paging.
+    for attr, count_key in (("memberOf", "memberOf_count"), ("member", "member_count")):
+        actual = next((k for k in decoded if k.lower() == attr.lower()), None)
+        if actual is not None:
+            value = decoded.pop(actual)
+            decoded[count_key] = len(value) if isinstance(value, list) else 1
     result["attributes"] = decoded
     return result

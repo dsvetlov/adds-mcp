@@ -5,7 +5,7 @@ description = "Read-only MCP servers for the Microsoft Active Directory family: 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.2.0,<2",
+    "mcp[cli]>=1.23,<2",  # >=1.23: DNS-rebinding protection (CVE-2025-66416)
     "ldap3>=2.9.1",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",

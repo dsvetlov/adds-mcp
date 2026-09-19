@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ..client import ReadOnlyADClient, escape_filter, filetime_days_ago
-from ._common import USER_ATTRS
+from ._common import FULL_USER_ATTRS, USER_ATTRS
 
 
 def _user_filter(search_filter: str | None) -> str:
@@ -19,13 +19,15 @@ def _user_filter(search_filter: str | None) -> str:
     return f"(&{base}{search_filter})"
 
 
-def _resolve_user(client: ReadOnlyADClient, identifier: str) -> dict[str, Any]:
+def _resolve_user(
+    client: ReadOnlyADClient, identifier: str, attributes: list[str] = USER_ATTRS
+) -> dict[str, Any]:
     """Look up a user by any common identifier. Returns a resolution dict."""
     ident = escape_filter(identifier)
     filt = _user_filter(
         f"(|(sAMAccountName={ident})(userPrincipalName={ident})(mail={ident})(distinguishedName={ident}))"
     )
-    results = client.search(search_filter=filt, attributes=USER_ATTRS, size_limit=2)
+    results = client.search(search_filter=filt, attributes=attributes, size_limit=2)
     if not results:
         return {"found": False, "identifier": identifier}
     if len(results) > 1:
@@ -116,7 +118,7 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
         ],
     ) -> dict[str, Any]:
         """Return the full attribute set for a single user."""
-        return _resolve_user(client, identifier)
+        return _resolve_user(client, identifier, attributes=FULL_USER_ATTRS)
 
     @mcp.tool(
         annotations={
@@ -141,21 +143,54 @@ def register(mcp: FastMCP, client: ReadOnlyADClient) -> None:
                 ),
             ),
         ] = False,
+        name_filter: Annotated[
+            str,
+            Field(
+                default="",
+                description=(
+                    "Substring matched against the group cn / sAMAccountName. "
+                    "A user may belong to hundreds of groups; filter to what you "
+                    "need, e.g. 'ROLE_' for role groups or a project key."
+                ),
+            ),
+        ] = "",
+        limit: Annotated[
+            int,
+            Field(default=200, ge=1, le=500, description="Maximum groups to return."),
+        ] = 200,
     ) -> dict[str, Any]:
-        """List all groups a user is a direct (or transitive) member of."""
+        """List the groups a user is a direct (or transitive) member of.
+
+        Filter by name and keep the limit modest: an account can belong to
+        hundreds of groups, and the whole list rarely helps.
+        """
         user = _resolve_user(client, identifier)
         if not user.get("found") or user.get("ambiguous"):
             return {"found": False, "identifier": identifier}
         user_dn = user["user"]["dn"]
         if recursive:
-            filt = f"(member:1.2.840.113556.1.4.1941:={escape_filter(user_dn)})"
+            membership = f"(member:1.2.840.113556.1.4.1941:={escape_filter(user_dn)})"
         else:
-            filt = f"(member={escape_filter(user_dn)})"
+            membership = f"(member={escape_filter(user_dn)})"
+        parts = [membership]
+        if name_filter:
+            f = escape_filter(name_filter)
+            parts.append(f"(|(cn=*{f}*)(sAMAccountName=*{f}*))")
         results = client.search(
-            search_filter=f"(&(objectCategory=group){filt})",
+            search_filter=f"(&(objectCategory=group){''.join(parts)})",
             attributes=["cn", "distinguishedName", "sAMAccountName", "groupType", "description"],
+            size_limit=limit + 1,
+            page_size=limit + 1,
         )
-        return {"user_dn": user_dn, "recursive": recursive, "count": len(results), "groups": results}
+        truncated = len(results) > limit
+        return {
+            "user_dn": user_dn,
+            "recursive": recursive,
+            "name_filter": name_filter,
+            "count": min(len(results), limit),
+            "truncated": truncated,
+            "groups": results[:limit],
+        }
 
     @mcp.tool(
         annotations={
